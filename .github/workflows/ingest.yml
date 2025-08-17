@@ -8,6 +8,7 @@ on:
 jobs:
   ingest:
     runs-on: ubuntu-latest
+
     defaults:
       run:
         working-directory: services/ingestor
@@ -21,20 +22,20 @@ jobs:
 
       - name: Install deps
         run: pip install -r requirements.txt
-        
-- name: Run ingestor
-  working-directory: services/ingestor
-  env:
-    PGHOST: ${{ secrets.PGHOST }}
-    PGPORT: ${{ secrets.PGPORT }}
-    PGDATABASE: ${{ secrets.PGDATABASE }}
-    PGUSER: ${{ secrets.PGUSER }}
-    PGPASSWORD: ${{ secrets.PGPASSWORD }}
-    PGSSLMODE: ${{ secrets.PGSSLMODE }}
-    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-    OPENAI_MODEL: gpt-4o-mini
-  run: python ingest.py
 
+      - name: Run ingestor
+        env:
+          # EITHER provide the full DSN in one secret:
+          PG_DSN: ${{ secrets.PG_DSN }}
 
-
-
+          # OR comment the line above and provide parts below:
+          PGHOST: ${{ secrets.PGHOST }}
+          PGPORT: ${{ secrets.PGPORT }}
+          PGDATABASE: ${{ secrets.PGDATABASE }}
+          PGUSER: ${{ secrets.PGUSER }}
+          PGPASSWORD: ${{ secrets.PGPASSWORD }}
+          PGSSLMODE: ${{ secrets.PGSSLMODE }}   # must be: require (no quotes)
+          PGOPTIONS: project=${{ secrets.SUPABASE_PROJECT_REF }}  # needed for Supabase pooler
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+        run: python ingest.py
