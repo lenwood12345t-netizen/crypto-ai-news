@@ -12,10 +12,10 @@ def make_slug(prefix:str)->str:
 
 local_tz = tz.gettz(TIMEZONE)
 
-# --- small helpers ------------------------------------------------------------
+# ---------- helpers -----------------------------------------------------------
 
 def posted_this_hour() -> bool:
-    """Prevent more than one post per hour."""
+    """Prevent more than one post per hour (UTC hour bucket)."""
     with conn.cursor() as cur:
         cur.execute("""
           select 1
@@ -26,6 +26,7 @@ def posted_this_hour() -> bool:
         return cur.fetchone() is not None
 
 def recent_assets(n:int=VARIETY_LOOKBACK) -> set:
+    """Return set of assets used in the last N posts."""
     with conn.cursor() as cur:
         cur.execute("""
           select asset
@@ -37,19 +38,17 @@ def recent_assets(n:int=VARIETY_LOOKBACK) -> set:
         return {r[0] for r in cur.fetchall() if r[0]}
 
 def pick_next_asset() -> str:
-    """Deterministic hourly choice + avoid repeating very recent asset."""
+    """Deterministic hourly choice; avoid recently used asset when possible."""
     hour = int(datetime.now(timezone.utc).strftime('%Y%m%d%H'))
     recent = recent_assets()
-    i = 0
-    while i < len(ASSET_ROTATION):
-        cand = ASSET_ROTATION[(hour + i) % len(ASSET_ROTATION)]
+    for offset in range(len(ASSET_ROTATION)):
+        cand = ASSET_ROTATION[(hour + offset) % len(ASSET_ROTATION)]
         if cand not in recent:
             return cand
-        i += 1
     return ASSET_ROTATION[hour % len(ASSET_ROTATION)]  # fallback
 
 def fresh_feed_candidates():
-    """Collect feed entries < FRESH_WINDOW_MIN old, newest first."""
+    """Collect feed entries fresher than FRESH_WINDOW_MIN minutes (newest first)."""
     items = []
     now = datetime.now(timezone.utc)
     for s in ALLOWLIST:
@@ -65,46 +64,48 @@ def fresh_feed_candidates():
     items.sort(key=lambda x: x[0], reverse=True)
     return items
 
-# --- main policy --------------------------------------------------------------
+# ---------- hourly policy -----------------------------------------------------
 
 def run_hourly():
-    # 1) Don’t double-post within the same hour
+    # 1) one post per hour, max
     if posted_this_hour():
         print("Already posted this hour; exiting.")
         return
 
-    # 2) Try to publish a **fresh news brief** from reputable feeds
-    recent = recent_assets()
+    # 2) Try fresh news first
     for published, s, e in fresh_feed_candidates():
         url = e.get('link')
         try:
             title, text = fetch_article(url)
         except Exception as ex:
-            print("fetch_article failed:", ex); continue
+            print("fetch_article failed:", ex)
+            continue
 
-        # De-dupe via raw_items; if already seen, insert_raw returns None
         h = text_hash(text)
         raw_id = insert_raw(upsert_source(s['name'], s['type'], s.get('rss')),
                             url, 'en', text, title, published, h)
         if not raw_id:
+            # duplicate URL
             continue
 
         insert_document(raw_id, url, title, text, published)
 
-        # Publish a news brief
         slug = make_slug('news')
-        src = [{"title": title, "url": url, "publisher": s['name'],
-                "date": (published.isoformat() if published else '')}]
+        src = [{
+            "title": title,
+            "url": url,
+            "publisher": s['name'],
+            "date": (published.isoformat() if published else '')
+        }]
         ctx = f"Title: {title}\n\nQuotes/Facts:\n{text[:2000]}"
         create_news_brief(slug, title, ctx, src)
         print("Posted news:", slug)
-        return  # one-and-done for this hour
+        return  # one-and-done this hour
 
-    # 3) If no fresh news, publish a **rotating spec_outlook** on a different asset
+    # 3) If no fresh news, publish rotating spec_outlook
     asset = pick_next_asset()
     slug = make_slug(asset)
-    # A minimal context is fine; LLM will craft scenarios.
-    ctx = f"Generate bull/base/bear scenarios for {asset.upper()} based on recent crypto context."
+    ctx = f"Create bull/base/bear scenarios for {asset.upper()} over 7d/30d based on current crypto context."
     create_spec_outlook(slug, asset, ctx, [])
     print("Posted spec_outlook:", slug, "asset:", asset)
 
