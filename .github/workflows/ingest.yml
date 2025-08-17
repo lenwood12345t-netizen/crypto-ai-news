@@ -1,17 +1,17 @@
-# .github/workflows/ingest.yml
 name: Ingest News
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # every 30 minutes (UTC)
-  workflow_dispatch:        # run it manually
+    - cron: '*/30 * * * *'   # every 30 min (UTC)
+  workflow_dispatch:
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: services/ingestor  # <-- IMPORTANT
+        working-directory: services/ingestor
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,9 +24,10 @@ jobs:
 
       - name: Run ingestor
         env:
-          PG_DSN: ${{ secrets.PG_DSN }}              # from repo settings
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}  # not used by the hello-world, but keep it
+          PG_DSN: ${{ secrets.PG_DSN }}            # <-- Transaction pooler DSN (6543)
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-4o-mini
         run: python ingest.py
+
 
 
