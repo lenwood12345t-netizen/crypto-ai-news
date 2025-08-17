@@ -1,5 +1,5 @@
 {
-  "name": "crypto-ai-news-gl3m",
+  "name": "crypto-ai-news-web",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -18,3 +18,4 @@
     "@types/node": "20.14.9"
   }
 }
+
