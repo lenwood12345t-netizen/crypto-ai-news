@@ -2,39 +2,71 @@ name: Ingest News
 
 on:
   schedule:
-    - cron: '0 * * * *'   # every hour (UTC)
-  workflow_dispatch:
+    - cron: "0 * * * *"     # every hour (UTC)
+  workflow_dispatch:        # allow manual runs
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
+
+    # All `run:` commands happen inside services/ingestor
     defaults:
       run:
         working-directory: services/ingestor
 
     steps:
-      - uses: actions/checkout@v4
+      # 1) Get your repo
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # 2) Python runtime
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      # 3) Clean install of deps from requirements.txt
+      - name: Install deps (clean)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade --no-cache-dir -r requirements.txt
 
-      - name: Sanity-check DSN (redacted)
+      # 4) Sanity-check that the right packages & DSN are present
+      - name: Sanity-check packages (redacted)
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
         run: |
           python - <<'PY'
-          import os, re
+          import os, sys, re, importlib
+          print("Python:", sys.version)
+
+          def try_import(mod):
+              try:
+                  m = importlib.import_module(mod)
+                  print(f"OK import {mod}", getattr(m, "__version__", ""))
+                  return True
+              except Exception as e:
+                  print(f"FAIL import {mod} -> {e}")
+                  return False
+
+          # These should succeed if requirements.txt is correct.
+          # If you're on lxml 5+, ensure lxml-html-clean is also installed.
+          try_import("lxml")
+          try_import("lxml.html")
+          try_import("lxml.html.clean")
+          try_import("readability")  # provided by readability-lxml
+          try_import("bs4")
+          try_import("normalize")    # your local file services/ingestor/normalize.py
+
           dsn = os.getenv("PG_DSN", "")
           print("PG_DSN present:", bool(dsn))
-          print("Contains sslmode=require:", "sslmode=require" in dsn)
-          host = re.search(r'@([^:/?]+)', dsn)
-          print("Host:", host.group(1) if host else "(not parsed)")
+          if dsn:
+              print("sslmode=require in DSN:", "sslmode=require" in dsn)
+              host = re.search(r"@([^/:?]+)", dsn)
+              print("Host parsed:", host.group(1) if host else "(not parsed)")
           PY
 
+      # 5) Run the ingestor
       - name: Run ingestor (hourly one-and-done)
         env:
           PG_DSN: ${{ secrets.PG_DSN }}
