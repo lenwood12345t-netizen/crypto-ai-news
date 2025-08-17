@@ -40,4 +40,4 @@ jobs:
           PG_DSN: ${{ secrets.PG_DSN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-4o-mini
-        ru
+  
