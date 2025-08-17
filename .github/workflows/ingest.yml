@@ -21,13 +21,20 @@ jobs:
 
       - name: Install deps
         run: pip install -r requirements.txt
+        
+- name: Run ingestor
+  working-directory: services/ingestor
+  env:
+    PGHOST: ${{ secrets.PGHOST }}
+    PGPORT: ${{ secrets.PGPORT }}
+    PGDATABASE: ${{ secrets.PGDATABASE }}
+    PGUSER: ${{ secrets.PGUSER }}
+    PGPASSWORD: ${{ secrets.PGPASSWORD }}
+    PGSSLMODE: ${{ secrets.PGSSLMODE }}
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_MODEL: gpt-4o-mini
+  run: python ingest.py
 
-      - name: Run ingestor
-        env:
-          PG_DSN: ${{ secrets.PG_DSN }}            # <-- Transaction pooler DSN (6543)
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-4o-mini
-        run: python ingest.py
 
 
 
