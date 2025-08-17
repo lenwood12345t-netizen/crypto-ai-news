@@ -1,3 +1,10 @@
+name: Ingest News
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # every hour (UTC)
+  workflow_dispatch:
+
 jobs:
   ingest:
     runs-on: ubuntu-latest
@@ -33,6 +40,4 @@ jobs:
           PG_DSN: ${{ secrets.PG_DSN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-4o-mini
-        run: python ingest.py
-
-
+        ru
