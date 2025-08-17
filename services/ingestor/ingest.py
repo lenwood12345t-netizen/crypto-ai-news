@@ -1,113 +1,131 @@
-import os, time, hashlib
-from datetime import datetime, timezone, timedelta
-from dateutil import tz
-from config import ALLOWLIST, TIMEZONE, ASSET_ROTATION, FRESH_WINDOW_MIN, VARIETY_LOOKBACK
-from normalize import fetch_rss, fetch_article, iso_date
-from dedupe import text_hash
-from db import upsert_source, insert_raw, insert_document, conn
-from generate import create_spec_outlook, create_news_brief
+# services/ingestor/ingest.py
+from __future__ import annotations
 
-def make_slug(prefix:str)->str:
-    return prefix + '-' + hashlib.sha1(str(time.time()).encode()).hexdigest()[:8]
+import json
+import os
+import time
+from typing import Iterable
 
-local_tz = tz.gettz(TIMEZONE)
+import psycopg2
+import psycopg2.extras
 
-# ---------- helpers -----------------------------------------------------------
+from normalize import (
+    fetch_rss,
+    fetch_article,
+    text_hash,
+    slugify,
+)
 
-def posted_this_hour() -> bool:
-    """Prevent more than one post per hour (UTC hour bucket)."""
-    with conn.cursor() as cur:
-        cur.execute("""
-          select 1
-          from articles
-          where date_trunc('hour', created_at) = date_trunc('hour', now())
-          limit 1
-        """)
-        return cur.fetchone() is not None
+# A few crypto feeds to start. You can add/remove as you like.
+FEEDS: list[str] = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+]
 
-def recent_assets(n:int=VARIETY_LOOKBACK) -> set:
-    """Return set of assets used in the last N posts."""
-    with conn.cursor() as cur:
-        cur.execute("""
-          select asset
-          from articles
-          where asset is not null
-          order by created_at desc
-          limit %s
-        """, (n,))
-        return {r[0] for r in cur.fetchall() if r[0]}
+TYPE = "news_brief"  # articles.type
 
-def pick_next_asset() -> str:
-    """Deterministic hourly choice; avoid recently used asset when possible."""
-    hour = int(datetime.now(timezone.utc).strftime('%Y%m%d%H'))
-    recent = recent_assets()
-    for offset in range(len(ASSET_ROTATION)):
-        cand = ASSET_ROTATION[(hour + offset) % len(ASSET_ROTATION)]
-        if cand not in recent:
-            return cand
-    return ASSET_ROTATION[hour % len(ASSET_ROTATION)]  # fallback
 
-def fresh_feed_candidates():
-    """Collect feed entries fresher than FRESH_WINDOW_MIN minutes (newest first)."""
-    items = []
-    now = datetime.now(timezone.utc)
-    for s in ALLOWLIST:
-        sid = upsert_source(s['name'], s['type'], s.get('rss'))
-        feed = fetch_rss(s['rss']) if s.get('rss') else {'entries': []}
-        for e in feed.get('entries', []):
-            published = iso_date(e.get('published') or e.get('updated'))
-            if not published:
-                continue
-            if (now - published) > timedelta(minutes=FRESH_WINDOW_MIN):
-                continue
-            items.append((published, s, e))
-    items.sort(key=lambda x: x[0], reverse=True)
-    return items
+def _connect() -> psycopg2.extensions.connection:
+    """
+    Connect using PG_DSN if present; else fall back to individual envs.
+    """
+    dsn = os.getenv("PG_DSN")
+    if dsn:
+        return psycopg2.connect(dsn)
 
-# ---------- hourly policy -----------------------------------------------------
+    host = os.getenv("PGHOST")
+    port = os.getenv("PGPORT", "6543")
+    db = os.getenv("PGDATABASE")
+    user = os.getenv("PGUSER", "postgres")
+    password = os.getenv("PGPASSWORD")
+    sslmode = os.getenv("PGSSLMODE", "require")
+    if not (host and db and password):
+        raise RuntimeError("Missing PG connection envs or PG_DSN")
 
-def run_hourly():
-    # 1) one post per hour, max
-    if posted_this_hour():
-        print("Already posted this hour; exiting.")
-        return
+    return psycopg2.connect(
+        host=host,
+        port=port,
+        dbname=db,
+        user=user,
+        password=password,
+        sslmode=sslmode,
+    )
 
-    # 2) Try fresh news first
-    for published, s, e in fresh_feed_candidates():
-        url = e.get('link')
-        try:
-            title, text = fetch_article(url)
-        except Exception as ex:
-            print("fetch_article failed:", ex)
+
+def _row_exists(cur: psycopg2.extensions.cursor, slug: str) -> bool:
+    cur.execute("SELECT 1 FROM public.articles WHERE slug = %s LIMIT 1", (slug,))
+    return cur.fetchone() is not None
+
+
+def _insert_article(
+    cur: psycopg2.extensions.cursor,
+    *,
+    slug: str,
+    title: str,
+    body_md: str,
+    json_payload: dict,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO public.articles (slug, type, title, body_md, json_payload)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (slug, TYPE, title, body_md, json.dumps(json_payload)),
+    )
+
+
+def iter_feed_items(feeds: Iterable[str]):
+    for url in feeds:
+        for item in fetch_rss(url, limit=25):
+            yield item
+
+
+def main() -> None:
+    print("INGESTOR: starting…")
+
+    conn = _connect()
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    inserted = 0
+    checked = 0
+
+    for item in iter_feed_items(FEEDS):
+        checked += 1
+        url = item.get("url")
+        title = (item.get("title") or "").strip()
+        if not url or not title:
             continue
 
-        h = text_hash(text)
-        raw_id = insert_raw(upsert_source(s['name'], s['type'], s.get('rss')),
-                            url, 'en', text, title, published, h)
-        if not raw_id:
-            # duplicate URL
+        # Build a stable slug/hash
+        title_hash = text_hash(title)
+        slug = f"{slugify(title)}-{title_hash[:6]}"
+
+        if _row_exists(cur, slug):
             continue
 
-        insert_document(raw_id, url, title, text, published)
+        art = fetch_article(url)
+        body_text = art.get("body_text") or ""
+        if not body_text:
+            # skip if no body
+            continue
 
-        slug = make_slug('news')
-        src = [{
-            "title": title,
-            "url": url,
-            "publisher": s['name'],
-            "date": (published.isoformat() if published else '')
-        }]
-        ctx = f"Title: {title}\n\nQuotes/Facts:\n{text[:2000]}"
-        create_news_brief(slug, title, ctx, src)
-        print("Posted news:", slug)
-        return  # one-and-done this hour
+        json_payload = {
+            "sources": [url],
+            "disclaimer": "Auto-ingested via GitHub Actions",
+            "ingested_ts": int(time.time()),
+        }
 
-    # 3) If no fresh news, publish rotating spec_outlook
-    asset = pick_next_asset()
-    slug = make_slug(asset)
-    ctx = f"Create bull/base/bear scenarios for {asset.upper()} over 7d/30d based on current crypto context."
-    create_spec_outlook(slug, asset, ctx, [])
-    print("Posted spec_outlook:", slug, "asset:", asset)
+        _insert_article(cur, slug=slug, title=title, body_md=body_text, json_payload=json_payload)
+        inserted += 1
+        print(f"+ inserted: {slug}")
 
-if __name__ == '__main__':
-    run_hourly()
+    cur.close()
+    conn.close()
+    print(f"INGESTOR: done. inserted={inserted}, seen={checked}")
+
+
+if __name__ == "__main__":
+    main()
+
