@@ -1,0 +1,28 @@
+name: Ingest News
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes (UTC)
+  workflow_dispatch:         # lets you run it manually
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ingestor
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run ingestor
+        env:
+          PG_DSN: ${{ secrets.PG_DSN }}
+          OPENAI_API_KEY: ${{ secrets.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 }}
+          OPENAI_MODEL: gpt-4o-mini
+        run: python ingest.py
