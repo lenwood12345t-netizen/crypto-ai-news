@@ -1,120 +1,112 @@
-import os, re, time, hashlib, requests, feedparser, psycopg2
-from bs4 import BeautifulSoup
-from readability import Document
-from dateutil import parser as dt
-from openai import OpenAI
+import os, time, hashlib
+from datetime import datetime, timezone, timedelta
+from dateutil import tz
+from config import ALLOWLIST, TIMEZONE, ASSET_ROTATION, FRESH_WINDOW_MIN, VARIETY_LOOKBACK
+from normalize import fetch_rss, fetch_article, iso_date
+from dedupe import text_hash
+from db import upsert_source, insert_raw, insert_document, conn
+from generate import create_spec_outlook, create_news_brief
 
-# --- config ---
-ALLOWLIST = [
-  ("CoinDesk",       "https://www.coindesk.com/arc/outboundfeeds/rss/"),
-  ("CoinTelegraph",  "https://cointelegraph.com/rss"),
-  ("Decrypt",        "https://decrypt.co/feed"),
-  ("SEC",            "https://www.sec.gov/news/pressreleases.rss"),
-]
-MAX_PER_FEED = int(os.getenv("MAX_PER_FEED", "5"))
-UA = {'User-Agent': 'CryptoAINewsBot/0.1 (+contact@yourdomain.com)'}
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+def make_slug(prefix:str)->str:
+    return prefix + '-' + hashlib.sha1(str(time.time()).encode()).hexdigest()[:8]
 
-# --- pg connection (build from split env or PG_DSN) ---
-def build_dsn_from_env():
-    host = os.getenv("PGHOST"); port = os.getenv("PGPORT")
-    db   = os.getenv("PGDATABASE"); user = os.getenv("PGUSER")
-    pw   = os.getenv("PGPASSWORD"); ssl = os.getenv("PGSSLMODE","require")
-    if all([host, port, db, user, pw]):
-        return f"host={host} port={port} dbname={db} user={user} password={pw} sslmode={ssl}"
-    return os.getenv("PG_DSN")
+local_tz = tz.gettz(TIMEZONE)
 
-PG_DSN = build_dsn_from_env()
-if not PG_DSN:
-    raise SystemExit("No PG connection info. Set split vars (PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD) or PG_DSN.")
+# --- small helpers ------------------------------------------------------------
 
-conn = psycopg2.connect(PG_DSN)
-conn.autocommit = True
-
-# --- openai client ---
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-def make_slug(title: str) -> str:
-    base = re.sub(r"[^a-z0-9\- ]","", title.lower()).strip().replace(" ", "-")
-    base = re.sub(r"-+","-", base)[:60].strip("-") or "story"
-    stamp = hashlib.sha1(str(time.time()).encode()).hexdigest()[:6]
-    return f"{base}-{stamp}"
-
-def fetch_article(url: str):
-    r = requests.get(url, headers=UA, timeout=20)
-    r.raise_for_status()
-    doc = Document(r.text)
-    title = (doc.title() or "").strip()
-    html = doc.summary()
-    soup = BeautifulSoup(html, "lxml")
-    text = "\n".join(p.get_text(" ", strip=True) for p in soup.find_all("p"))
-    return title, text
-
-def summarize_md(title: str, text: str, source_name: str, url: str) -> str:
-    prompt = f"""
-You are a careful news editor. Using ONLY the facts below, write a 120–180 word,
-neutral, markdown news brief. End with one line: **Why it matters for crypto:** <short reason>.
-No speculation, no price targets.
-
-TITLE: {title}
-
-FACTS/QUOTES:
-{text[:2000]}
-
-Include a tiny bullet list of key takeaways at the end.
-"""
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role":"user","content":prompt}],
-        temperature=0.4
-    )
-    return resp.choices[0].message.content or ""
-
-def insert_article(slug, title, body_md, sources_json):
+def posted_this_hour() -> bool:
+    """Prevent more than one post per hour."""
     with conn.cursor() as cur:
         cur.execute("""
-            insert into articles (slug, type, asset, title, body_md, json_payload, confidence)
-            values (%s, 'news_brief', NULL, %s, %s, %s::jsonb, 'medium')
-            on conflict (slug) do nothing
-            returning id
-        """, (slug, title, body_md, sources_json))
-        row = cur.fetchone()
-        return (row[0] if row else None)
+          select 1
+          from articles
+          where date_trunc('hour', created_at) = date_trunc('hour', now())
+          limit 1
+        """)
+        return cur.fetchone() is not None
 
-def run_once():
-    made = 0
-    for (name, rss) in ALLOWLIST:
-        feed = feedparser.parse(rss)
-        for entry in feed.get("entries", [])[:MAX_PER_FEED]:
-            url = entry.get("link")
-            if not url: continue
-            try:
-                title, text = fetch_article(url)
-                if not (title and text and len(text) > 200):
-                    continue
-                slug = make_slug(title)
-                md = summarize_md(title, text, name, url)
-                pub = entry.get("published") or entry.get("updated") or ""
-                pub_iso = ""
-                try:
-                    pub_iso = dt.parse(pub).isoformat()
-                except Exception:
-                    pass
-                payload = {
-                    "sources":[{"title": title, "url": url, "publisher": name, "date": pub_iso}],
-                    "disclaimer":"AI-generated. Informational only."
-                }
-                import json
-                aid = insert_article(slug, title, md, json.dumps(payload))
-                if aid:
-                    made += 1
-            except Exception as e:
-                # Log and continue (keeps action green)
-                print("ERROR on", url, "->", repr(e))
+def recent_assets(n:int=VARIETY_LOOKBACK) -> set:
+    with conn.cursor() as cur:
+        cur.execute("""
+          select asset
+          from articles
+          where asset is not null
+          order by created_at desc
+          limit %s
+        """, (n,))
+        return {r[0] for r in cur.fetchall() if r[0]}
+
+def pick_next_asset() -> str:
+    """Deterministic hourly choice + avoid repeating very recent asset."""
+    hour = int(datetime.now(timezone.utc).strftime('%Y%m%d%H'))
+    recent = recent_assets()
+    i = 0
+    while i < len(ASSET_ROTATION):
+        cand = ASSET_ROTATION[(hour + i) % len(ASSET_ROTATION)]
+        if cand not in recent:
+            return cand
+        i += 1
+    return ASSET_ROTATION[hour % len(ASSET_ROTATION)]  # fallback
+
+def fresh_feed_candidates():
+    """Collect feed entries < FRESH_WINDOW_MIN old, newest first."""
+    items = []
+    now = datetime.now(timezone.utc)
+    for s in ALLOWLIST:
+        sid = upsert_source(s['name'], s['type'], s.get('rss'))
+        feed = fetch_rss(s['rss']) if s.get('rss') else {'entries': []}
+        for e in feed.get('entries', []):
+            published = iso_date(e.get('published') or e.get('updated'))
+            if not published:
                 continue
-    print(f"Inserted {made} article(s)")
+            if (now - published) > timedelta(minutes=FRESH_WINDOW_MIN):
+                continue
+            items.append((published, s, e))
+    items.sort(key=lambda x: x[0], reverse=True)
+    return items
 
-if __name__ == "__main__":
-    run_once()
+# --- main policy --------------------------------------------------------------
 
+def run_hourly():
+    # 1) Don’t double-post within the same hour
+    if posted_this_hour():
+        print("Already posted this hour; exiting.")
+        return
 
+    # 2) Try to publish a **fresh news brief** from reputable feeds
+    recent = recent_assets()
+    for published, s, e in fresh_feed_candidates():
+        url = e.get('link')
+        try:
+            title, text = fetch_article(url)
+        except Exception as ex:
+            print("fetch_article failed:", ex); continue
+
+        # De-dupe via raw_items; if already seen, insert_raw returns None
+        h = text_hash(text)
+        raw_id = insert_raw(upsert_source(s['name'], s['type'], s.get('rss')),
+                            url, 'en', text, title, published, h)
+        if not raw_id:
+            continue
+
+        insert_document(raw_id, url, title, text, published)
+
+        # Publish a news brief
+        slug = make_slug('news')
+        src = [{"title": title, "url": url, "publisher": s['name'],
+                "date": (published.isoformat() if published else '')}]
+        ctx = f"Title: {title}\n\nQuotes/Facts:\n{text[:2000]}"
+        create_news_brief(slug, title, ctx, src)
+        print("Posted news:", slug)
+        return  # one-and-done for this hour
+
+    # 3) If no fresh news, publish a **rotating spec_outlook** on a different asset
+    asset = pick_next_asset()
+    slug = make_slug(asset)
+    # A minimal context is fine; LLM will craft scenarios.
+    ctx = f"Generate bull/base/bear scenarios for {asset.upper()} based on recent crypto context."
+    create_spec_outlook(slug, asset, ctx, [])
+    print("Posted spec_outlook:", slug, "asset:", asset)
+
+if __name__ == '__main__':
+    run_hourly()
