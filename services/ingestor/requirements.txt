@@ -1,4 +1,4 @@
-# Postgres driver
+# Postgres
 psycopg2-binary==2.9.9
 
 # HTTP & parsing
@@ -6,12 +6,10 @@ requests==2.32.3
 beautifulsoup4==4.12.3
 feedparser==6.0.11
 
-# Readability (uses lxml)
+# Readability stack (modern lxml with cleaner)
+lxml[html_clean]==5.2.2
 readability-lxml==0.8.1
-lxml==5.2.2
-lxml-html-clean==0.1.2   # required for lxml>=5 (provides lxml.html.clean)
 
-# Dates (helpful for robust date parsing; safe to keep)
+# Dates/util
 python-dateutil==2.9.0.post0
 dateparser==1.2.0
-
